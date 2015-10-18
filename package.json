@@ -14,7 +14,7 @@
   "dependencies": {
     "async": "^1.4.2",
     "augur": "^1.0.2",
-    "ratebeer": "^1.2.0",
+    "ratebeer": "^1.2.1",
     "seraph": "^0.13.3",
     "underscore": "^1.8.3",
     "vinmonopolet": "^2.0.1"

@@ -3,6 +3,7 @@ var db = require('seraph')();
 var _ = require('underscore');
 var augur = require('augur');
 var async = require('async');
+var ratebeer = require('ratebeer');
 
 var txn = db.batch();
 var productCount = 0;
@@ -59,6 +60,7 @@ vinmonopolet.getProductStream().on('data', function(product) {
   txn.query(query, {product:product, stripped:stripped});
   
   var fetchAvailability = augur();
+  ops.push(fetchAvailability);
   
   vinmonopolet.getProduct(product.sku, function(err, product) {
     if (err) return fetchAvailability();
@@ -80,6 +82,27 @@ vinmonopolet.getProductStream().on('data', function(product) {
     secondary.query(query, {product:product});
     fetchAvailability()
   });
+  
+  var fetchRatebeerMetadata = augur();
+  ops.push(fetchRatebeerMetadata);
+  ratebeer.getBeer(product.manufacturer + ' ' + product.title, function(err, beer) {
+    if (err) return fetchRatebeerMetadata();
+    var query = "MATCH (beer:beer { sku: {product}.sku }) ";
+    var sets = [];
+    if (beer.ratingOverall != null) {
+      sets.push("beer.ratebeerRatingOverall = {rb}.ratingOverall");
+      sets.push("beer.ratebeerRatingStyle = {rb}.ratingStyle");
+    }
+    if (beer.desc) sets.push("beer.desc = {rb}.desc");
+    if (beer.ibu) sets.push("beer.ibu = {rb}.ibu");
+    if (beer.style) sets.push("beer.style = {rb}.style");
+    if (sets.length > 0) {
+      query += 'SET ' + sets.join(', ');
+      secondary.query(query, {product:product, rb: beer});
+    }
+    fetchRatebeerMetadata();
+  });
+
 }).on('end', function() {
   console.log('finished with ' + productCount + ' beers. committing transaction...');
   txn.commit(function(e, res) {
