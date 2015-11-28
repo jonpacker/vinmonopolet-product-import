@@ -9,6 +9,12 @@ var txn = db.batch();
 var productCount = 0;
 var ops = [];
 var secondary = db.batch();
+var ratebeerQueryCounts = 0;
+var vmQueryCounts = 0;
+
+var beerFetchQueue = async.queue(ratebeer.getBeer, 15);
+var getBeer = beerFetchQueue.push.bind(beerFetchQueue)
+
 vinmonopolet.getProductStream().on('data', function(product) {
   if (product.productType != 'Øl') return;
   productCount++
@@ -27,7 +33,7 @@ vinmonopolet.getProductStream().on('data', function(product) {
     query += 'MERGE beer-[:brewed_in]->region ';
   }
   if (product.subregion) {
-    query += 'MERGE (subregion:subregion { name: {product}.subregion })<-[:has_subregion]-region ';
+    query += 'MERGE (subregion:subregion { name: {product}.subRegion })<-[:has_subregion]-region ';
     query += 'MERGE beer-[:brewed_in]->subregion ';
   }
   if (product.wholesaler) {
@@ -53,17 +59,29 @@ vinmonopolet.getProductStream().on('data', function(product) {
     });
   }
   
-  query += 'SET beer = {stripped} RETURN beer.sku';
+  var stripped = _.omit(product, ['manufacturer', 'country', 'region', 'subRegion', 'wholesaler', 'distributor', 'foodPairings']);
 
-  var stripped = _.omit(product, ['manufacturer', 'country', 'region', 'subregion', 'wholesaler', 'distributor', 'foodPairings']);
+  Object.keys(stripped).forEach(function(key) {
+    query += 'SET beer.' + key + ' = {stripped}.' + key + ' ';
+  });
+
+  query += 'RETURN beer.sku';
   
   txn.query(query, {product:product, stripped:stripped});
   
   var fetchAvailability = augur();
   ops.push(fetchAvailability);
   
+
+  var timeout = false;
+  setTimeout(function() { if (!timeout) fetchAvailability()},120000);
   vinmonopolet.getProduct(product.sku, function(err, product) {
-    if (err) return fetchAvailability();
+    timeout = true;
+    if (err || !product) return fetchAvailability();
+    
+    vmQueryCounts++;
+    if (vmQueryCounts % 100 == 0) console.log("Finished", vmQueryCounts, "getProduct calls");
+
     var query = "MATCH (beer:beer { sku: {product}.sku }) ";
     query += " OPTIONAL MATCH (:store)<-[old_stock_rel:in_stock]-beer ";
     query += " DELETE old_stock_rel ";
@@ -85,31 +103,45 @@ vinmonopolet.getProductStream().on('data', function(product) {
   
   var fetchRatebeerMetadata = augur();
   ops.push(fetchRatebeerMetadata);
-  ratebeer.getBeer(product.manufacturer + ' ' + product.title, function(err, beer) {
-    if (err) return fetchRatebeerMetadata();
+  getBeer(product.manufacturer + ' ' + product.title, function(err, res) {
+    if (res) processRatebeerMetadata(null,res);
+    else getBeer(product.title, function(err, res) {
+      if (res) processRatebeerMetadata(null,res);
+      else fetchRatebeerMetadata();
+    });
+  });
+  var processRatebeerMetadata = function(err, beer) {
+    ratebeerQueryCounts++;
+    if (ratebeerQueryCounts % 100 == 0) console.log("Finished", ratebeerQueryCounts, "ratebeer queries");
+    if (err || !beer) return fetchRatebeerMetadata();
     var query = "MATCH (beer:beer { sku: {product}.sku }) ";
     var sets = [];
     if (beer.ratingOverall != null) {
       sets.push("beer.ratebeerRatingOverall = {rb}.ratingOverall");
       sets.push("beer.ratebeerRatingStyle = {rb}.ratingStyle");
     }
+    if (beer.ratingsWeightedAverage) sets.push("beer.ratebeerWeightedAverage = {rb}.ratingsWeightedAverage");
     if (beer.desc) sets.push("beer.desc = {rb}.desc");
     if (beer.ibu) sets.push("beer.ibu = {rb}.ibu");
-    if (beer.style) sets.push("beer.style = {rb}.style");
+    if (beer.style) { 
+      query += 'MERGE (style:style { name: {rb}.style }) ';
+      query += 'MERGE beer-[:has_style]->style'
+    }
     if (sets.length > 0) {
       query += 'SET ' + sets.join(', ');
       secondary.query(query, {product:product, rb: beer});
     }
     fetchRatebeerMetadata();
-  });
-
+  }
 }).on('end', function() {
   console.log('finished with ' + productCount + ' beers. committing transaction...');
   txn.commit(function(e, res) {
     if (e) return console.log(e);
     console.log('done');
     console.log('waiting for secondary data acquisition to finish...');
-    async.parallel(ops, function() {
+    var jcount = 0;
+    var jobs = ops.map(function(op) { return function(cb) {op.then(function() { if (++jcount % 100 == 0) console.log('jcount =', jcount,'/',ops.length); cb() })}})
+    async.parallel(jobs, function() {
       console.log('done');
       console.log('running ' + secondary.operations.length +  ' secondary additions...');
       secondary.commit(function(e,res ){
