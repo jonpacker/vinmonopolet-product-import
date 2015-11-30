@@ -4,6 +4,7 @@ var _ = require('underscore');
 var augur = require('augur');
 var async = require('async');
 var ratebeer = require('ratebeer');
+var findCorrectRatebeerEntry = require('./match_ratebeer');
 
 var txn = db.batch();
 var productCount = 0;
@@ -11,9 +12,6 @@ var ops = [];
 var secondary = db.batch();
 var ratebeerQueryCounts = 0;
 var vmQueryCounts = 0;
-
-var beerFetchQueue = async.queue(ratebeer.getBeer, 15);
-var getBeer = beerFetchQueue.push.bind(beerFetchQueue)
 
 vinmonopolet.getProductStream().on('data', function(product) {
   if (product.productType != 'Øl') return;
@@ -103,19 +101,22 @@ vinmonopolet.getProductStream().on('data', function(product) {
   
   var fetchRatebeerMetadata = augur();
   ops.push(fetchRatebeerMetadata);
-  getBeer(product.manufacturer + ' ' + product.title, function(err, res) {
-    if (res) processRatebeerMetadata(null,res);
-    else getBeer(product.title, function(err, res) {
-      if (res) processRatebeerMetadata(null,res);
-      else fetchRatebeerMetadata();
+  findCorrectRatebeerEntry(db,product, function(err, res) {
+    if (err || !res) return fetchRatebeerMetadata();
+    ratebeer.getBeerByUrl(res,function(err, beer) {
+      if (err || !beer) fetchRatebeerMetadata();
+      else {
+        beer.url = res;
+        processRatebeerMetadata(beer);
+      }
     });
   });
-  var processRatebeerMetadata = function(err, beer) {
+  var processRatebeerMetadata = function(beer) {
     ratebeerQueryCounts++;
     if (ratebeerQueryCounts % 100 == 0) console.log("Finished", ratebeerQueryCounts, "ratebeer queries");
-    if (err || !beer) return fetchRatebeerMetadata();
+    if (!beer) return fetchRatebeerMetadata();
     var query = "MATCH (beer:beer { sku: {product}.sku }) ";
-    var sets = [];
+    var sets = [beer.url ? "beer.ratebeerUrl = {rb}.url" : ""];
     if (beer.ratingOverall != null) {
       sets.push("beer.ratebeerRatingOverall = {rb}.ratingOverall");
       sets.push("beer.ratebeerRatingStyle = {rb}.ratingStyle");
